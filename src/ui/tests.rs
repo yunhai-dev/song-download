@@ -39,6 +39,43 @@ fn search_input_accepts_typed_text_and_requires_login(cx: &mut TestAppContext) {
         cx.update(|_, app| view.read(app).download_notice.clone()),
         Some("请先登录后再搜索".to_owned())
     );
+
+    // Clearing the field then receiving a stale platform range must not panic.
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_keystrokes("backspace");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, app| view.read(app).search_input.read(app).content()),
+        ""
+    );
+    let input = cx.update(|_, app| view.read(app).search_input.clone());
+    cx.simulate_input("abc");
+    cx.simulate_keystrokes("backspace");
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, app| input.read(app).content()), "ab");
+
+    // Clicking the placeholder must not place the cursor inside the hint text.
+    let field = cx
+        .debug_bounds("search-input")
+        .expect("search field")
+        .center();
+    cx.simulate_click(field, Modifiers::none());
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_keystrokes("backspace");
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, app| input.read(app).content()), "");
+    let field = cx.debug_bounds("search-input").unwrap().center();
+    cx.simulate_click(field, Modifiers::none());
+    cx.simulate_keystrokes("backspace");
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, app| input.read(app).content()), "");
+
+    cx.update(|window, app| {
+        input.update(app, |input, cx| {
+            gpui::EntityInputHandler::replace_text_in_range(input, Some(0..30), "", window, cx);
+        });
+    });
+    assert_eq!(cx.update(|_, app| input.read(app).content()), "");
 }
 
 #[gpui::test]

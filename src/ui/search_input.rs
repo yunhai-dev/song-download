@@ -140,12 +140,14 @@ impl SearchInput {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let offset = offset.min(self.content.len());
         self.selected_range = offset..offset;
         self.selection_reversed = false;
         cx.notify();
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let offset = offset.min(self.content.len());
         if offset < self.selected_range.start {
             self.selected_range = offset..self.selected_range.start;
             self.selection_reversed = true;
@@ -165,6 +167,9 @@ impl SearchInput {
     }
 
     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
+        if self.content.is_empty() {
+            return 0;
+        }
         let (Some(bounds), Some(line)) = (self.last_bounds.as_ref(), self.last_layout.as_ref())
         else {
             return 0;
@@ -212,6 +217,22 @@ impl SearchInput {
         self.offset_from_utf16(range_utf16.start)..self.offset_from_utf16(range_utf16.end)
     }
 
+    /// macOS keeps its own copy of the text and can send a replacement range that is
+    /// longer than our current content after a command (select-all, delete) already
+    /// changed it. Clip to char boundaries instead of panicking.
+    fn clamp_range(&self, range: Range<usize>) -> Range<usize> {
+        let len = self.content.len();
+        let mut start = range.start.min(len);
+        while start > 0 && !self.content.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = range.end.min(len);
+        while end < len && !self.content.is_char_boundary(end) {
+            end += 1;
+        }
+        start..end.max(start)
+    }
+
     fn previous_boundary(&self, offset: usize) -> usize {
         self.content
             .grapheme_indices(true)
@@ -236,7 +257,7 @@ impl EntityInputHandler for SearchInput {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let range = self.range_from_utf16(&range_utf16);
+        let range = self.clamp_range(self.range_from_utf16(&range_utf16));
         actual_range.replace(self.range_to_utf16(&range));
         Some(self.content[range].to_string())
     }
@@ -248,7 +269,7 @@ impl EntityInputHandler for SearchInput {
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
-            range: self.range_to_utf16(&self.selected_range),
+            range: self.range_to_utf16(&self.clamp_range(self.selected_range.clone())),
             reversed: self.selection_reversed,
         })
     }
@@ -271,11 +292,19 @@ impl EntityInputHandler for SearchInput {
         cx: &mut Context<Self>,
     ) {
         let new_text = new_text.replace(['\n', '\r'], "");
-        let range = range_utf16
+        let explicit = range_utf16.is_some();
+        let raw = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        if raw.start > self.content.len() || raw.end > self.content.len() {
+            if !explicit {
+                self.selected_range = self.content.len()..self.content.len();
+            }
+            return;
+        }
+        let range = self.clamp_range(raw);
         self.content =
             (self.content[0..range.start].to_owned() + &new_text + &self.content[range.end..])
                 .into();
@@ -293,21 +322,30 @@ impl EntityInputHandler for SearchInput {
         cx: &mut Context<Self>,
     ) {
         let new_text = new_text.replace(['\n', '\r'], "");
-        let range = range_utf16
+        let explicit = range_utf16.is_some();
+        let raw = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        if raw.start > self.content.len() || raw.end > self.content.len() {
+            if !explicit {
+                self.selected_range = self.content.len()..self.content.len();
+            }
+            return;
+        }
+        let range = self.clamp_range(raw);
         self.content =
             (self.content[0..range.start].to_owned() + &new_text + &self.content[range.end..])
                 .into();
         self.marked_range =
             (!new_text.is_empty()).then_some(range.start..range.start + new_text.len());
-        self.selected_range = new_selected_range_utf16
+        let selected = new_selected_range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
             .map(|range| range.start + range.start..range.end + range.start)
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.selected_range = self.clamp_range(selected);
         cx.notify();
     }
 
@@ -319,7 +357,7 @@ impl EntityInputHandler for SearchInput {
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let last_layout = self.last_layout.as_ref()?;
-        let range = self.range_from_utf16(&range_utf16);
+        let range = self.clamp_range(self.range_from_utf16(&range_utf16));
         Some(Bounds::from_corners(
             point(
                 bounds.left() + last_layout.x_for_index(range.start),
@@ -519,6 +557,7 @@ impl gpui::Element for TextElement {
 impl Render for SearchInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .debug_selector(|| "search-input".to_owned())
             .key_context("SearchInput")
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
