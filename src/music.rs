@@ -154,11 +154,12 @@ impl Music {
             ),
         };
         let root = std::env::var_os("SONG_DOWNLOAD_ROOT")
-            .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from);
+            .map(PathBuf::from)
+            .unwrap_or_else(bridge_root);
         let qq_store_path = qq_store
             .as_ref()
             .map(|store| store.path.display().to_string());
-        let child = Command::new("node")
+        let child = Command::new(node_command())
             .arg(root.join("bridge/main.cjs"))
             .env("SONG_DOWNLOAD_BRIDGE_TOKEN", &token)
             .stdin(Stdio::piped())
@@ -379,6 +380,41 @@ impl Music {
             Provider::Netease => netease::lyric(self, account, song),
         }
     }
+}
+
+fn node_command() -> PathBuf {
+    if let Some(node) = std::env::var_os("SONG_DOWNLOAD_NODE") {
+        return PathBuf::from(node);
+    }
+    // GUI-launched apps do not inherit the shell PATH, so check the usual install roots.
+    for candidate in [
+        "/opt/homebrew/bin/node",
+        "/usr/local/bin/node",
+        "/usr/bin/node",
+    ] {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return path;
+        }
+    }
+    PathBuf::from("node")
+}
+
+fn bridge_root() -> PathBuf {
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        let mut candidates = vec![directory.to_path_buf()];
+        if let Some(contents) = directory.parent() {
+            candidates.push(contents.join("Resources"));
+        }
+        for candidate in candidates {
+            if candidate.join("bridge/main.cjs").is_file() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
 pub fn is_http(url: &Url) -> bool {
