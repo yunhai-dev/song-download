@@ -1,4 +1,5 @@
 mod download;
+mod downloads;
 mod music;
 mod ui;
 

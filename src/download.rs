@@ -10,9 +10,18 @@ use reqwest::{
     blocking::{Client, Response},
     header::CONTENT_TYPE,
 };
+use serde::{Deserialize, Serialize};
 use tempfile::{Builder, NamedTempFile};
 
 use crate::music::{Account, Music, Provider, Song, is_http};
+
+/// Outcome of one track download: the saved audio file plus the user-facing
+/// report of every attempted asset.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Receipt {
+    pub audio_path: PathBuf,
+    pub summary: String,
+}
 
 const AUDIO_LIMIT: u64 = 512 * 1024 * 1024;
 const COVER_LIMIT: u64 = 16 * 1024 * 1024;
@@ -23,15 +32,15 @@ const BUFFER: usize = 64 * 1024;
 
 /// Downloads the full audio track and best-effort cover/lyrics into `folder`.
 ///
-/// The returned text is user-facing and reports every attempted asset together
-/// with its file name or the concrete reason it was skipped.
+/// The receipt is user-facing and reports every attempted asset together with
+/// its file name or the concrete reason it was skipped.
 pub fn download(
     music: &Music,
     provider: Provider,
     account: &Account,
     song: &Song,
     folder: &Path,
-) -> Result<String> {
+) -> Result<Receipt> {
     let audio = music
         .audio(provider, account, song)
         .with_context(|| format!("{}：获取音频地址失败", provider.label()))?;
@@ -43,6 +52,7 @@ pub fn download(
 
     let audio_name =
         save_audio(music.web(), &audio.url, folder, &stem, &ext).context("音频下载失败")?;
+    let audio_path = folder.join(&audio_name);
     let stem = Path::new(&audio_name)
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -77,7 +87,10 @@ pub fn download(
         Err(error) => summary.push_str(&format!("\n歌词：失败（{error:#}）")),
     }
 
-    Ok(summary)
+    Ok(Receipt {
+        audio_path,
+        summary,
+    })
 }
 
 fn save_audio(client: &Client, url: &str, folder: &Path, stem: &str, ext: &str) -> Result<String> {

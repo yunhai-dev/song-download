@@ -14,7 +14,8 @@ use anyhow::{Context, Result, ensure};
 use reqwest::{Url, blocking::Client, redirect::Policy};
 use serde_json::{Value, json};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Provider {
     Qq,
     Netease,
