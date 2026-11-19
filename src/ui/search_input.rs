@@ -534,6 +534,8 @@ impl Render for SearchInput {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .h(px(30.0))
             .w_full()
+            .flex()
+            .items_center()
             .px_2()
             .rounded_md()
             .border_1()
