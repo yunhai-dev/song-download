@@ -1,10 +1,50 @@
-use gpui::{Modifiers, TestAppContext, px, size};
+use gpui::{Focusable, KeyBinding, Modifiers, TestAppContext, px, size};
 
 use super::*;
 
 #[gpui::test]
+fn search_input_accepts_typed_text_and_requires_login(cx: &mut TestAppContext) {
+    cx.update(|app| {
+        super::search_input::bind_keys(app);
+        app.bind_keys([KeyBinding::new("enter", SubmitSearch, None)]);
+    });
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let search_input = cx.new(super::search_input::SearchInput::new);
+        Desktop {
+            provider: Provider::Qq,
+            libraries: Default::default(),
+            search_input,
+            music: None,
+            startup_error: None,
+            startup_warning: None,
+            folder: None,
+            show_downloads: false,
+            downloads: Queue::default(),
+            download_notice: None,
+        }
+    });
+
+    let handle = cx.update(|_, app| view.read(app).search_input.read(app).focus_handle(app));
+    cx.update(|window, _| window.focus(&handle));
+    cx.simulate_input("稻香");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, app| view.read(app).search_input.read(app).content()),
+        "稻香"
+    );
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, app| view.read(app).download_notice.clone()),
+        Some("请先登录后再搜索".to_owned())
+    );
+}
+
+#[gpui::test]
 fn track_columns_stay_aligned_at_two_window_widths(cx: &mut TestAppContext) {
-    let (view, cx) = cx.add_window_view(|_, _| {
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let search_input = cx.new(super::search_input::SearchInput::new);
         let song = |id: &str, name: &str, artist: &str| Song {
             id: id.into(),
             mid: id.into(),
@@ -42,8 +82,10 @@ fn track_columns_stay_aligned_at_two_window_widths(cx: &mut TestAppContext) {
                 },
                 Library::default(),
             ],
+            search_input,
             music: None,
             startup_error: None,
+            startup_warning: None,
             folder: None,
             show_downloads: false,
             downloads,
@@ -75,6 +117,28 @@ fn track_columns_stay_aligned_at_two_window_widths(cx: &mut TestAppContext) {
         widths.push(first.size.width);
     }
     assert!(widths[1] > widths[0]);
+
+    let select_first = cx.debug_bounds("track-select-0").unwrap().center();
+    cx.simulate_click(select_first, Modifiers::none());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("batch-bar").is_some());
+    assert_eq!(
+        cx.update(|_, app| view.read(app).libraries[0].selected_tracks.len()),
+        1
+    );
+
+    let select_second = cx.debug_bounds("track-select-1").unwrap().center();
+    cx.simulate_click(select_second, Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, app| view.read(app).libraries[0].selected_tracks.len()),
+        2
+    );
+
+    let select_all = cx.debug_bounds("track-select-all").unwrap().center();
+    cx.simulate_click(select_all, Modifiers::none());
+    cx.run_until_parked();
+    assert!(cx.update(|_, app| view.read(app).libraries[0].selected_tracks.is_empty()));
 
     let manager = cx.debug_bounds("nav-downloads").unwrap().center();
     cx.simulate_click(manager, Modifiers::none());

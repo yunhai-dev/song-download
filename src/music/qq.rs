@@ -80,24 +80,49 @@ fn account_name(profile: &Value) -> String {
         .unwrap_or_else(|| "QQ音乐用户".to_string())
 }
 
-fn account_from_cookie(m: &Music, cookie: &str) -> anyhow::Result<Account> {
+/// `/login/status`：包在凭证不可用时返回 200 加空 `data`，凭证被上游明确拒绝时返回 301/401。
+pub(super) fn restore(m: &Music, cookie: &str) -> anyhow::Result<Option<Account>> {
+    let cookie = cookie.trim();
+    if cookie.is_empty() {
+        return Ok(None);
+    }
     let body = bridge(m, "/login/status", &[], cookie)?;
-    let body = require_code(body, 200, "读取QQ音乐账号")?;
-    let profile = body
-        .pointer("/data/profile")
-        .filter(|profile| profile.is_object())
-        .ok_or_else(|| anyhow!("QQ音乐登录成功，但无法读取账号资料，请重新扫码登录"))?;
+    account_from_status(&body, cookie)
+}
+
+/// 只有包声明的「未登录」应答才算 None；其他形状异常或上游故障必须冒泡，不能当成登出。
+fn account_from_status(body: &Value, cookie: &str) -> anyhow::Result<Option<Account>> {
+    let code = body
+        .get("code")
+        .and_then(number)
+        .ok_or_else(|| anyhow!("QQ音乐登录状态返回异常：缺少状态码"))?;
+    match code {
+        200 => {}
+        301 | 401 => return Ok(None),
+        other => anyhow::bail!("QQ音乐登录状态返回异常（平台状态码：{other}）"),
+    }
+
+    let data = body
+        .get("data")
+        .filter(|data| data.is_object())
+        .ok_or_else(|| anyhow!("QQ音乐登录状态返回异常：缺少账号数据"))?;
+    let Some(profile) = data.get("profile") else {
+        // 登录状态始终 200；没有 profile 就是包的「未登录」应答。
+        return Ok(None);
+    };
+    if !profile.is_object() {
+        anyhow::bail!("QQ音乐登录状态返回异常：账号资料格式错误");
+    }
+
     let id = account_id(profile);
     if id.is_empty() {
-        return Err(anyhow!(
-            "QQ音乐登录成功，但无法读取账号标识，请重新扫码登录"
-        ));
+        anyhow::bail!("QQ音乐登录状态返回异常：账号资料缺少账号标识");
     }
-    Ok(Account {
+    Ok(Some(Account {
         name: account_name(profile),
         id,
         cookie: cookie.to_string(),
-    })
+    }))
 }
 
 pub(super) fn qr(m: &Music) -> anyhow::Result<Qr> {
@@ -142,8 +167,10 @@ pub(super) fn poll(m: &Music, key: &str) -> anyhow::Result<Poll> {
                     "QQ音乐登录确认成功，但本地适配器未返回会话，请重新扫码"
                 ));
             }
-            let account = account_from_cookie(m, cookie.trim())?;
-            Ok(Poll::SignedIn(account))
+            match restore(m, cookie.trim())? {
+                Some(account) => Ok(Poll::SignedIn(account)),
+                None => Err(anyhow!("QQ音乐登录确认成功，但会话无效，请重新扫码登录")),
+            }
         }
         other => Err(anyhow!("QQ音乐登录状态返回未知状态码：{other}")),
     }
@@ -375,6 +402,50 @@ pub(super) fn tracks(
             Ok(page_from_list(&songs, offset, limit))
         }
     }
+}
+
+pub(super) fn search(
+    m: &Music,
+    account: &Account,
+    query: &str,
+    offset: usize,
+    limit: usize,
+) -> anyhow::Result<Page<Song>> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Page {
+            items: Vec::new(),
+            more: false,
+        });
+    }
+    let limit = limit.clamp(1, 20);
+    let page = offset / limit + 1;
+    let limit = limit.to_string();
+    let page = page.to_string();
+    let body = api(
+        m,
+        account,
+        "/search",
+        &[
+            ("keyword", query),
+            ("type", "song"),
+            ("page", page.as_str()),
+            ("limit", limit.as_str()),
+        ],
+    )?;
+    let body = require_code(body, 200, "搜索QQ音乐")?;
+    search_page(&body, offset)
+}
+
+fn search_page(body: &Value, offset: usize) -> anyhow::Result<Page<Song>> {
+    let songs = body["items"]
+        .as_array()
+        .context("QQ音乐搜索返回异常：缺少歌曲列表")?;
+    let items = songs.iter().filter_map(song_from).collect::<Vec<_>>();
+    let total = number(&body["total"]);
+    let more = body["more"].as_bool().unwrap_or(false)
+        || total.is_some_and(|total| offset as u64 + (songs.len() as u64) < total);
+    Ok(Page { items, more })
 }
 
 fn audio_ext(url: &str) -> &'static str {
@@ -630,6 +701,33 @@ mod tests {
     }
 
     #[test]
+    fn search_maps_lite_items_and_reports_more() {
+        let body = json!({
+            "code": 200,
+            "total": 30,
+            "more": true,
+            "items": [{
+                "mid": "0027oMO61wWi55",
+                "name": "发如雪",
+                "interval": 299,
+                "singer": [{ "name": "周杰伦" }],
+                "album": { "mid": "0024bjiL2aocxT", "name": "十一月的萧邦" },
+                "file": { "media_mid": "002A6j2q1tdUUP" }
+            }]
+        });
+        let page = search_page(&body, 0).expect("search page");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].mid, "0027oMO61wWi55");
+        assert_eq!(page.items[0].artist, "周杰伦");
+        assert!(page.items[0].cover.is_some());
+        assert!(page.more);
+
+        let empty = search_page(&json!({ "items": [], "total": 0 }), 0).unwrap();
+        assert!(empty.items.is_empty());
+        assert!(!empty.more);
+    }
+
+    #[test]
     fn audio_extension_comes_from_the_url_path() {
         assert_eq!(
             audio_ext("http://dl.stream.qqmusic.qq.com/M500x.mp3?guid=1"),
@@ -644,5 +742,51 @@ mod tests {
     fn qrc_detection_requires_a_time_range_not_an_lrc_stamp() {
         assert!(is_qrc("[1234,567]晚风(0,200)轻轻(200,300)"));
         assert!(!is_qrc("[00:12.34]普通歌词"));
+    }
+
+    #[test]
+    fn login_status_only_treats_known_empty_answers_as_signed_out() {
+        let signed_in = json!({
+            "code": 200,
+            "data": { "profile": { "str_musicid": "100", "nickname": "甲" } }
+        });
+        let account = account_from_status(&signed_in, "qm_keyst=secret")
+            .expect("valid session")
+            .expect("account");
+        assert_eq!(account.id, "100");
+        assert_eq!(account.name, "甲");
+        assert_eq!(account.cookie, "qm_keyst=secret");
+
+        // The package answers 200 with an empty `data` for a missing or unusable credential.
+        assert!(
+            account_from_status(&json!({ "code": 200, "data": {} }), "qm_keyst=x")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            account_from_status(&json!({ "code": 301 }), "qm_keyst=x")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            account_from_status(&json!({ "code": 401 }), "qm_keyst=x")
+                .unwrap()
+                .is_none()
+        );
+
+        // Anything else is a protocol failure, never a logout.
+        for body in [
+            json!({ "code": 200, "data": { "profile": {} } }),
+            json!({ "code": 200, "data": { "profile": null } }),
+            json!({ "code": 200, "data": [] }),
+            json!({ "code": 500, "data": {} }),
+            json!({ "data": {} }),
+            json!({}),
+        ] {
+            let error = account_from_status(&body, "qm_keyst=secret")
+                .err()
+                .expect("malformed");
+            assert!(!format!("{error:#}").contains("secret"));
+        }
     }
 }

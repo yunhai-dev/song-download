@@ -19,15 +19,15 @@ use crate::{
 
 const BG: u32 = 0xf9f9fb;
 const SIDEBAR: u32 = 0xf3f3f6;
-const PANEL: u32 = 0xffffff;
+pub(super) const PANEL: u32 = 0xffffff;
 const ELEVATED: u32 = 0xf0f0f4;
 const HOVER: u32 = 0xececf1;
-const BORDER: u32 = 0xdcdce5;
+pub(super) const BORDER: u32 = 0xdcdce5;
 const BORDER_SOFT: u32 = 0xe8e8ee;
 const TEXT: u32 = 0x202027;
-const MUTED: u32 = 0x555564;
-const FAINT: u32 = 0x646478;
-const ACCENT: u32 = 0x5b50cd;
+pub(super) const MUTED: u32 = 0x555564;
+pub(super) const FAINT: u32 = 0x646478;
+pub(super) const ACCENT: u32 = 0x5b50cd;
 const ACCENT_HOVER: u32 = 0x4e43b9;
 const ACCENT_SOFT: u32 = 0xeeecff;
 const GREEN: u32 = 0x176c49;
@@ -85,6 +85,7 @@ impl Desktop {
             .flex_row()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
+            .on_action(cx.listener(Self::submit_search))
             .child(sidebar)
             .child(
                 div()
@@ -93,8 +94,11 @@ impl Desktop {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .child(self.topbar(title, subtitle))
+                    .child(self.topbar(title, subtitle, cx))
                     .when_some(self.download_notice.clone(), |main, notice| {
+                        main.child(notice_bar(notice))
+                    })
+                    .when_some(self.startup_warning.clone(), |main, notice| {
                         main.child(notice_bar(notice))
                     })
                     .child(
@@ -110,7 +114,7 @@ impl Desktop {
             )
     }
 
-    fn topbar(&self, title: &'static str, subtitle: String) -> Div {
+    fn topbar(&self, title: &'static str, subtitle: String, cx: &mut Context<Self>) -> Div {
         div()
             .w_full()
             .flex_shrink_0()
@@ -141,11 +145,26 @@ impl Desktop {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .child(div().w(px(200.0)).child(self.search_input.clone()))
+                    .child(accent_button("search-submit", "搜索").on_click(cx.listener(
+                        |app, _: &ClickEvent, _, cx| {
+                            let query = app.search_input.read(cx).content();
+                            app.start_search(query, cx);
+                        },
+                    )))
+                    .when(
+                        self.libraries[self.provider.index()].showing_search,
+                        |row| {
+                            row.child(ghost_button("search-clear", "返回").on_click(
+                                cx.listener(|app, _: &ClickEvent, _, cx| app.clear_search(cx)),
+                            ))
+                        },
+                    )
                     .child(chip(
                         self.libraries[self.provider.index()]
                             .account
                             .as_ref()
-                            .map_or("本地会话", |_| "已登录"),
+                            .map_or("未登录", |_| "已登录"),
                         MUTED,
                         ELEVATED,
                     ))
@@ -450,6 +469,7 @@ impl Desktop {
                             .when(
                                 self.music.is_some()
                                     && !state.authenticating
+                                    && !state.restoring
                                     && self.startup_error.is_none(),
                                 |row| {
                                     row.child(
@@ -471,7 +491,7 @@ impl Desktop {
                         div()
                             .text_xs()
                             .text_color(rgb(FAINT))
-                            .child("凭据仅保存在本机，关闭应用后需要重新扫码"),
+                            .child("登录状态保存在系统钥匙串，下次打开自动恢复"),
                     ),
             )
     }
@@ -479,7 +499,7 @@ impl Desktop {
     fn browser(&self, state: &Library, cx: &mut Context<Self>) -> Div {
         let title = state.selected.and_then(|index| state.playlists.get(index));
         let playlist_count = state.playlists.len();
-        let track_count = state.tracks.len();
+        let track_count = state.visible_tracks().len();
         let list_note = if state.loading_lists {
             Some("正在同步歌单…".to_owned())
         } else if let Some(error) = &state.list_error {
@@ -489,21 +509,53 @@ impl Desktop {
         } else {
             None
         };
-        let track_note = if state.loading_tracks {
+        let track_note = if state.showing_search {
+            if state.searching {
+                Some("正在搜索…".to_owned())
+            } else if let Some(error) = &state.search_error {
+                Some(error.clone())
+            } else if state.search_results.is_empty() {
+                Some("没有找到匹配的歌曲".to_owned())
+            } else {
+                None
+            }
+        } else if state.loading_tracks {
             Some("正在加载歌曲…".to_owned())
         } else if let Some(error) = &state.track_error {
             Some(error.clone())
         } else if title.is_none() {
-            Some("从左侧选择一个歌单".to_owned())
+            Some("从左侧选择一个歌单，或搜索全站歌曲".to_owned())
         } else if state.tracks.is_empty() {
             Some("当前歌单没有可显示的歌曲".to_owned())
         } else {
             None
         };
-        let more = state.more;
-        let has_error = state.track_error.is_some();
-        let offset = state.offset;
-        let selected = state.selected;
+        let more = if state.showing_search {
+            state.search_more
+        } else {
+            state.more
+        };
+        let has_error = if state.showing_search {
+            state.search_error.is_some()
+        } else {
+            state.track_error.is_some()
+        };
+        let display_title = if state.showing_search {
+            format!("搜索：{}", state.search_query)
+        } else {
+            title.map_or_else(|| "歌曲".to_owned(), |playlist| playlist.name.clone())
+        };
+        let count_label = if state.showing_search {
+            if track_count == 0 {
+                "全站搜索结果".to_owned()
+            } else {
+                format!("{track_count} 首结果")
+            }
+        } else if track_count == 0 {
+            "尚未载入歌曲".to_owned()
+        } else {
+            format!("{track_count} 首歌曲")
+        };
 
         div()
             .flex_1()
@@ -614,22 +666,18 @@ impl Desktop {
                                             .truncate()
                                             .text_sm()
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .child(title.map_or_else(
-                                                || "歌曲".to_owned(),
-                                                |playlist| playlist.name.clone(),
-                                            )),
+                                            .child(display_title),
                                     )
-                                    .child(div().text_xs().text_color(rgb(MUTED)).child(
-                                        if track_count == 0 {
-                                            "尚未载入歌曲".to_owned()
-                                        } else {
-                                            format!("{track_count} 首歌曲")
-                                        },
-                                    )),
+                                    .child(
+                                        div().text_xs().text_color(rgb(MUTED)).child(count_label),
+                                    ),
                             )
                             .child(chip(self.provider.label(), MUTED, ELEVATED)),
                     )
-                    .child(track_header())
+                    .child(track_header(self, cx))
+                    .when(!state.selected_tracks.is_empty(), |panel| {
+                        panel.child(batch_bar(self, cx))
+                    })
                     .when_some(track_note, |panel, message| {
                         panel.child(
                             div()
@@ -667,13 +715,9 @@ impl Desktop {
                                         "load-more",
                                         if has_error { "重试" } else { "加载更多" },
                                     )
-                                    .on_click(cx.listener(
-                                        move |app, _: &ClickEvent, _, cx| {
-                                            if let Some(index) = selected {
-                                                app.load_tracks(index, offset > 0, cx);
-                                            }
-                                        },
-                                    )),
+                                    .on_click(
+                                        cx.listener(|app, _: &ClickEvent, _, cx| app.load_more(cx)),
+                                    ),
                                 ),
                         )
                     }),
@@ -834,7 +878,10 @@ impl Render for Desktop {
 // Track table
 // ---------------------------------------------------------------------------
 
-fn track_header() -> Div {
+fn track_header(app: &Desktop, cx: &mut Context<Desktop>) -> Div {
+    let state = &app.libraries[app.provider.index()];
+    let visible = state.visible_tracks().len();
+    let all_selected = visible > 0 && state.selected_tracks.len() == visible;
     div()
         .debug_selector(|| "track-header".to_owned())
         .flex_shrink_0()
@@ -847,6 +894,11 @@ fn track_header() -> Div {
         .bg(rgb(BG))
         .border_b_1()
         .border_color(rgb(BORDER_SOFT))
+        .child(
+            checkbox("track-select-all", all_selected)
+                .debug_selector(|| "track-select-all".to_owned())
+                .on_click(cx.listener(|app, _: &ClickEvent, _, cx| app.select_all_tracks(cx))),
+        )
         .child(
             div()
                 .w(px(INDEX_W))
@@ -887,9 +939,71 @@ fn track_header() -> Div {
         )
 }
 
+fn batch_bar(app: &Desktop, cx: &mut Context<Desktop>) -> Div {
+    let count = app.libraries[app.provider.index()].selected_tracks.len();
+    div()
+        .debug_selector(|| "batch-bar".to_owned())
+        .flex_shrink_0()
+        .h(px(44.0))
+        .px(px(16.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .bg(rgb(ACCENT_SOFT))
+        .border_b_1()
+        .border_color(rgb(BORDER_SOFT))
+        .child(
+            div()
+                .debug_selector(|| "batch-count".to_owned())
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_xs()
+                .text_color(rgb(ACCENT))
+                .child(dot(ACCENT))
+                .child(format!("已选 {count} 首")),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(ghost_button("clear-selection", "清除选择").on_click(
+                    cx.listener(|app, _: &ClickEvent, _, cx| app.clear_track_selection(cx)),
+                ))
+                .child(
+                    accent_button("batch-download", "加入下载").on_click(
+                        cx.listener(|app, _: &ClickEvent, _, cx| app.download_selected(cx)),
+                    ),
+                ),
+        )
+}
+
+fn checkbox(id: impl Into<gpui::ElementId>, checked: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .size(px(16.0))
+        .flex_shrink_0()
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(rgb(if checked { ACCENT } else { BORDER }))
+        .bg(rgb(if checked { ACCENT } else { PANEL }))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_xs()
+        .text_color(rgb(WHITE))
+        .when(checked, |box_| box_.child("✓"))
+}
+
 fn track_row(app: &mut Desktop, index: usize, cx: &mut Context<Desktop>) -> Div {
     let provider = app.provider;
-    let song = &app.libraries[provider.index()].tracks[index];
+    let state = &app.libraries[provider.index()];
+    let visible = state.visible_tracks();
+    let song = &visible[index];
+    let selected = state.selected_tracks.contains(&index);
     let key = TrackKey::new(provider, song);
     let status = app.downloads.status(&key);
     let seconds = song.seconds;
@@ -953,9 +1067,17 @@ fn track_row(app: &mut Desktop, index: usize, cx: &mut Context<Desktop>) -> Div 
         .flex()
         .items_center()
         .gap_3()
+        .bg(rgb(if selected { ACCENT_SOFT } else { PANEL }))
         .border_b_1()
         .border_color(rgb(BORDER_SOFT))
         .hover(|style| style.bg(rgb(BG)))
+        .child(
+            checkbox(("track-select", index), selected)
+                .debug_selector(move || format!("track-select-{index}"))
+                .on_click(cx.listener(move |app, _: &ClickEvent, _, cx| {
+                    app.toggle_track_selection(index, cx)
+                })),
+        )
         .child(
             div()
                 .w(px(INDEX_W))

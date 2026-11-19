@@ -1,6 +1,7 @@
 mod download;
 mod downloads;
 mod music;
+mod session;
 mod ui;
 
 use gpui::{Application, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};

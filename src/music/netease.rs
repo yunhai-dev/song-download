@@ -52,9 +52,12 @@ pub(super) fn poll(m: &Music, key: &str) -> Result<Poll> {
         PollStep::Waiting => Ok(Poll::Waiting),
         PollStep::Scanned => Ok(Poll::Scanned),
         PollStep::Expired => Ok(Poll::Expired),
-        PollStep::SignedIn(cookie) => read_account(m, &cookie)
-            .map(Poll::SignedIn)
-            .context("网易云已确认登录，但读取账号失败"),
+        PollStep::SignedIn(cookie) => {
+            match restore(m, &cookie).context("网易云已确认登录，但读取账号失败")? {
+                Some(account) => Ok(Poll::SignedIn(account)),
+                None => anyhow::bail!("网易云已确认登录，但登录凭据无效或为匿名会话，请重新扫码"),
+            }
+        }
     }
 }
 
@@ -225,36 +228,140 @@ fn poll_step(value: &Value) -> Result<PollStep> {
     }
 }
 
-fn read_account(m: &Music, cookie: &str) -> Result<Account> {
-    let value = checked(
-        m.api(Provider::Netease, ROUTE_ACCOUNT, &[], cookie)?,
-        200,
-        "读取网易云账号",
-    )?;
-    let profile = &value["profile"];
+/// `/user/account`：未登录时回 200 加空 profile；平台拒绝凭据时回 301/401。
+pub(super) fn restore(m: &Music, cookie: &str) -> Result<Option<Account>> {
+    let cookie = cookie.trim();
+    // 没有 MUSIC_U 时请求层会自动补游客 MUSIC_A，那样的 200 绝不是登录账号。
+    if !has_music_u(cookie) {
+        return Ok(None);
+    }
+    let value = m.api(Provider::Netease, ROUTE_ACCOUNT, &[], cookie)?;
+    account_from_response(&value, cookie)
+}
 
-    let id = [
-        text(&value["account"]["id"]),
-        text(&profile["userId"]),
-        text(&profile["id"]),
-    ]
-    .into_iter()
-    .find(|id| !id.trim().is_empty() && id.trim() != "0")
-    .context("网易云未返回账号标识")?;
+fn has_music_u(cookie: &str) -> bool {
+    cookie.split(';').any(|pair| {
+        pair.split_once('=')
+            .is_some_and(|(name, value)| name.trim() == "MUSIC_U" && !value.trim().is_empty())
+    })
+}
+
+/// 只有包声明的「未登录/游客」应答才算 None；其他形状异常或上游故障必须冒泡，不能当成登出。
+fn account_from_response(value: &Value, cookie: &str) -> Result<Option<Account>> {
+    let code = platform_code(value).context("网易云账号信息返回异常：缺少状态码")?;
+    match code {
+        200 => {}
+        301 | 401 => return Ok(None),
+        other => anyhow::bail!("读取网易云账号失败（平台状态码：{other}）"),
+    }
+
+    let account = value.get("account");
+    if account.is_some_and(anonymous_account) {
+        return Ok(None);
+    }
+    let profile = match value.get("profile") {
+        // 上游的未登录/游客应答是 200 加空 profile（null、缺失或空对象）。
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(profile)) if profile.is_empty() => return Ok(None),
+        Some(Value::Object(profile)) => profile,
+        Some(_) => anyhow::bail!("网易云账号信息返回异常：账号资料格式错误"),
+    };
+    if anonymous_profile(profile) {
+        return Ok(None);
+    }
+
+    let id = profile.get("userId").map(text).unwrap_or_default();
+    let id = id.trim();
+    if id.is_empty() {
+        anyhow::bail!("网易云账号信息返回异常：账号资料缺少账号标识");
+    }
+    if id == "0" {
+        // 游客资料会带 userId 0；正常账号不会。
+        return Ok(None);
+    }
+    let id = id.to_owned();
 
     let name = [
-        text(&profile["nickname"]),
-        text(&value["account"]["userName"]),
+        profile.get("nickname").map(text).unwrap_or_default(),
+        value
+            .get("account")
+            .and_then(|account| account.get("userName"))
+            .map(text)
+            .unwrap_or_default(),
     ]
     .into_iter()
     .find(|name| !name.trim().is_empty())
     .unwrap_or_else(|| id.clone());
 
-    Ok(Account {
+    Ok(Some(Account {
         name,
         id,
         cookie: cookie.to_owned(),
-    })
+    }))
+}
+
+fn anonymous_account(account: &Value) -> bool {
+    account.as_object().is_some_and(anonymous_marker) || number(&account["type"]) == Some(0)
+}
+
+fn anonymous_profile(profile: &serde_json::Map<String, Value>) -> bool {
+    anonymous_marker(profile)
+}
+
+fn anonymous_marker(object: &serde_json::Map<String, Value>) -> bool {
+    ["anonimousUser", "anonymousUser", "anonymous"]
+        .iter()
+        .any(|key| object.get(*key).and_then(Value::as_bool) == Some(true))
+}
+
+pub(super) fn search(
+    m: &Music,
+    account: &Account,
+    query: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<Page<Song>> {
+    let query = query.trim();
+    if query.is_empty() || limit == 0 {
+        return Ok(Page {
+            items: Vec::new(),
+            more: false,
+        });
+    }
+    let limit = limit.to_string();
+    let offset = offset.to_string();
+    let value = checked(
+        m.api(
+            Provider::Netease,
+            "/search",
+            &[
+                ("keywords", query),
+                ("type", "1"),
+                ("limit", limit.as_str()),
+                ("offset", offset.as_str()),
+            ],
+            &account.cookie,
+        )?,
+        200,
+        "搜索网易云音乐",
+    )?;
+    let result = value
+        .get("result")
+        .filter(|result| result.is_object())
+        .context("网易云搜索返回异常：缺少结果")?;
+    search_page(result, offset.parse().unwrap_or(0))
+}
+
+fn search_page(result: &Value, offset: usize) -> Result<Page<Song>> {
+    let songs = result
+        .get("songs")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let items = songs.iter().filter_map(song_from_value).collect::<Vec<_>>();
+    let total = number(&result["songCount"]);
+    let more = total.is_some_and(|total| offset as u64 + (songs.len() as u64) < total);
+    Ok(Page { items, more })
 }
 
 fn page_from_songs(songs: &[Value], limit: usize) -> Page<Song> {
@@ -534,6 +641,29 @@ mod tests {
     }
 
     #[test]
+    fn search_maps_song_count_and_items() {
+        let result = json!({
+            "songCount": 21,
+            "songs": [{
+                "id": 509781655,
+                "name": "想你就写信",
+                "duration": 238698,
+                "artists": [{ "name": "周杰伦" }],
+                "album": { "name": "中国新歌声", "picUrl": "http://p1.music.126.net/a.jpg" }
+            }]
+        });
+        let page = search_page(&result, 0).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, "509781655");
+        assert_eq!(page.items[0].artist, "周杰伦");
+        assert_eq!(page.items[0].seconds, 238);
+        assert!(page.more);
+
+        let last = search_page(&result, 20).unwrap();
+        assert!(!last.more);
+    }
+
+    #[test]
     fn maps_qr_states_including_confirmed_cookie() {
         assert!(matches!(
             poll_step(&json!({ "code": 800 })).unwrap(),
@@ -553,5 +683,75 @@ mod tests {
         }
         assert!(poll_step(&json!({ "code": 803, "cookie": "" })).is_err());
         assert!(poll_step(&json!({})).is_err());
+    }
+
+    #[test]
+    fn restore_requires_a_login_music_u_cookie() {
+        assert!(has_music_u("MUSIC_U=abc; __csrf=x"));
+        assert!(has_music_u(" __csrf=x ; MUSIC_U = abc "));
+        assert!(!has_music_u(""));
+        assert!(!has_music_u("MUSIC_A=guest; __csrf=x"));
+        assert!(!has_music_u("MUSIC_U= ; __csrf=x"));
+        assert!(!has_music_u("XMUSIC_U=abc"));
+    }
+
+    #[test]
+    fn account_response_only_treats_known_empty_answers_as_signed_out() {
+        let signed_in = json!({
+            "code": 200,
+            "account": { "id": 7, "userName": "u", "type": 1 },
+            "profile": { "userId": 7, "nickname": "甲" }
+        });
+        let account = account_from_response(&signed_in, "MUSIC_U=secret")
+            .expect("valid session")
+            .expect("account");
+        assert_eq!(account.id, "7");
+        assert_eq!(account.name, "甲");
+        assert_eq!(account.cookie, "MUSIC_U=secret");
+
+        // The package's logged-out answer.
+        for body in [
+            json!({ "code": 200, "account": null, "profile": null }),
+            json!({ "code": 200 }),
+            json!({ "code": 200, "account": null, "profile": {} }),
+        ] {
+            assert!(account_from_response(&body, "MUSIC_U=x").unwrap().is_none());
+        }
+        assert!(
+            account_from_response(&json!({ "code": 301 }), "MUSIC_U=x")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            account_from_response(&json!({ "code": 401 }), "MUSIC_U=x")
+                .unwrap()
+                .is_none()
+        );
+
+        // Anonymous profiles are never accepted as a login.
+        for body in [
+            json!({ "code": 200, "account": { "id": 9, "type": 0 }, "profile": { "userId": 9 } }),
+            json!({
+                "code": 200,
+                "account": { "id": 9, "type": 1 },
+                "profile": { "userId": 9, "anonimousUser": true }
+            }),
+            json!({ "code": 200, "account": { "id": 9, "type": 1 }, "profile": { "userId": 0 } }),
+        ] {
+            assert!(account_from_response(&body, "MUSIC_U=x").unwrap().is_none());
+        }
+
+        // Anything else is a protocol failure, never a logout.
+        for body in [
+            json!({ "code": 200, "account": { "id": 9 }, "profile": "nope" }),
+            json!({ "code": 200, "account": { "id": 9 }, "profile": { "nickname": "甲" } }),
+            json!({ "code": 500 }),
+            json!({}),
+        ] {
+            let error = account_from_response(&body, "MUSIC_U=secret")
+                .err()
+                .expect("malformed");
+            assert!(!format!("{error:#}").contains("secret"));
+        }
     }
 }

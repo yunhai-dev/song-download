@@ -5525,9 +5525,11 @@ dependencies = [
  "gpui",
  "lyrics-crypto",
  "reqwest",
+ "security-framework",
  "serde",
  "serde_json",
  "tempfile",
+ "unicode-segmentation",
  "uuid",
 ]
 

@@ -116,10 +116,16 @@ pub struct Music {
     local: Client,
     web: Client,
     bridge: Arc<Bridge>,
+    qq_store_ready: bool,
+}
+
+pub struct Startup {
+    pub music: Music,
+    pub warning: Option<String>,
 }
 
 impl Music {
-    pub fn new() -> Result<Self> {
+    pub fn new() -> Result<Startup> {
         let local = Client::builder()
             .no_proxy()
             .redirect(Policy::none())
@@ -138,8 +144,20 @@ impl Music {
             .timeout(Duration::from_secs(120))
             .build()?;
         let token = uuid::Uuid::new_v4().simple().to_string();
+        let (qq_store, mut warning) = match crate::session::qq_store() {
+            Ok(store) => (Some(store), None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "无法安全保存登录状态（{error:#}）；本次登录只在应用运行期间有效"
+                )),
+            ),
+        };
         let root = std::env::var_os("SONG_DOWNLOAD_ROOT")
             .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from);
+        let qq_store_path = qq_store
+            .as_ref()
+            .map(|store| store.path.display().to_string());
         let child = Command::new("node")
             .arg(root.join("bridge/main.cjs"))
             .env("SONG_DOWNLOAD_BRIDGE_TOKEN", &token)
@@ -153,31 +171,75 @@ impl Music {
             endpoint: String::new(),
             token,
         };
+        if let Some(stdin) = bridge.child.stdin.as_mut() {
+            use std::io::Write as _;
+            serde_json::to_writer(&mut *stdin, &json!({ "qq": qq_store }))
+                .context("无法配置本地适配器的持久化会话")?;
+            writeln!(stdin).context("无法配置本地适配器的持久化会话")?;
+            stdin.flush().context("无法配置本地适配器的持久化会话")?;
+        }
         let stdout = bridge
             .child
             .stdout
             .take()
             .context("无法读取适配器启动状态")?;
-        let (sender, receiver) = mpsc::sync_channel(1);
+        enum AdapterEvent {
+            Port(u16),
+            Warning(String),
+            Fatal(String),
+        }
+        let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Some(port) = line
+                let event = if line.starts_with("SONG_DOWNLOAD_QQ_STORE_ERROR") {
+                    AdapterEvent::Warning(match &qq_store_path {
+                        Some(path) => format!(
+                            "QQ 音乐加密登录记录无法读取（{path}），本次登录不会保留；删除该文件后可重新建立"
+                        ),
+                        None => "QQ 音乐加密登录记录无法读取，本次登录不会保留".to_owned(),
+                    })
+                } else if let Some(code) = line.strip_prefix("SONG_DOWNLOAD_ERROR=") {
+                    AdapterEvent::Fatal(format!("本地适配器启动失败（{}）", code.trim()))
+                } else if let Some(port) = line
                     .strip_prefix("SONG_DOWNLOAD_PORT=")
                     .and_then(|value| value.parse::<u16>().ok())
                     .filter(|port| *port != 0)
                 {
-                    let _ = sender.try_send(port);
+                    AdapterEvent::Port(port)
+                } else {
+                    continue;
+                };
+                if sender.send(event).is_err() {
+                    break;
                 }
             }
         });
-        let port = receiver
-            .recv_timeout(Duration::from_secs(15))
-            .context("本地适配器未就绪，请在项目目录运行 npm ci --ignore-scripts")?;
+        let started = std::time::Instant::now();
+        let port = loop {
+            let remaining = Duration::from_secs(15).saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                anyhow::bail!("本地适配器未就绪，请在项目目录运行 npm ci --ignore-scripts");
+            }
+            match receiver.recv_timeout(remaining) {
+                Ok(AdapterEvent::Port(port)) => break port,
+                Ok(AdapterEvent::Warning(message)) => {
+                    warning.get_or_insert(message);
+                }
+                Ok(AdapterEvent::Fatal(message)) => anyhow::bail!(message),
+                Err(_) => {
+                    anyhow::bail!("本地适配器未就绪，请在项目目录运行 npm ci --ignore-scripts")
+                }
+            }
+        };
         bridge.endpoint = format!("http://127.0.0.1:{port}");
-        Ok(Self {
-            local,
-            web,
-            bridge: Arc::new(bridge),
+        Ok(Startup {
+            music: Self {
+                local,
+                web,
+                bridge: Arc::new(bridge),
+                qq_store_ready: warning.is_none(),
+            },
+            warning,
         })
     }
 
@@ -218,6 +280,45 @@ impl Music {
         }
     }
 
+    pub fn restore(&self, provider: Provider, cookie: &str) -> Result<Option<Account>> {
+        match provider {
+            Provider::Qq => qq::restore(self, cookie),
+            Provider::Netease => netease::restore(self, cookie),
+        }
+    }
+
+    pub fn forget_qq(&self, cookie: &str) -> Result<()> {
+        if cookie.trim().is_empty() {
+            return Ok(());
+        }
+        self.api(Provider::Qq, "/logout", &[], cookie).map(drop)
+    }
+
+    pub fn qq_store_ready(&self) -> bool {
+        self.qq_store_ready
+    }
+
+    pub fn qq_persisted(&self, cookie: &str) -> Result<bool> {
+        let response = self
+            .local
+            .post(format!("{}/session/persisted", self.bridge.endpoint))
+            .header("Authorization", &self.bridge.token)
+            .json(&json!({ "cookie": cookie }))
+            .send()
+            .context("QQ音乐：无法确认登录记录是否已加密保存")?;
+        let status = response.status();
+        let value = response
+            .json::<Value>()
+            .context("QQ音乐：无法确认登录记录是否已加密保存")?;
+        ensure!(
+            status.is_success(),
+            "QQ音乐：无法确认登录记录是否已加密保存"
+        );
+        value["persisted"]
+            .as_bool()
+            .context("QQ音乐：登录记录状态无效")
+    }
+
     pub fn poll(&self, provider: Provider, key: &str) -> Result<Poll> {
         match provider {
             Provider::Qq => qq::poll(self, key),
@@ -229,6 +330,20 @@ impl Music {
         match provider {
             Provider::Qq => qq::playlists(self, account),
             Provider::Netease => netease::playlists(self, account),
+        }
+    }
+
+    pub fn search(
+        &self,
+        provider: Provider,
+        account: &Account,
+        query: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<Song>> {
+        match provider {
+            Provider::Qq => qq::search(self, account, query, offset, limit),
+            Provider::Netease => netease::search(self, account, query, offset, limit),
         }
     }
 
