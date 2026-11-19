@@ -17,25 +17,26 @@ use crate::{
     music::Provider,
 };
 
-const BG: u32 = 0x0a0a0d;
-const SIDEBAR: u32 = 0x0e0e12;
-const PANEL: u32 = 0x141419;
-const ELEVATED: u32 = 0x1b1b23;
-const HOVER: u32 = 0x22222c;
-const BORDER: u32 = 0x262631;
-const BORDER_SOFT: u32 = 0x1f1f28;
-const TEXT: u32 = 0xe9e9f0;
-const MUTED: u32 = 0x9595a6;
-const FAINT: u32 = 0x838396;
-const ACCENT: u32 = 0x8b7cf6;
-const ACCENT_HOVER: u32 = 0x9c8ff8;
-const ACCENT_SOFT: u32 = 0x211d33;
-const GREEN: u32 = 0x5cd6a0;
-const GREEN_SOFT: u32 = 0x15261f;
-const RED: u32 = 0xf2768c;
-const RED_SOFT: u32 = 0x2b1720;
-const AMBER: u32 = 0xe7b674;
-const AMBER_SOFT: u32 = 0x2a2215;
+const BG: u32 = 0xf9f9fb;
+const SIDEBAR: u32 = 0xf3f3f6;
+const PANEL: u32 = 0xffffff;
+const ELEVATED: u32 = 0xf0f0f4;
+const HOVER: u32 = 0xececf1;
+const BORDER: u32 = 0xdcdce5;
+const BORDER_SOFT: u32 = 0xe8e8ee;
+const TEXT: u32 = 0x202027;
+const MUTED: u32 = 0x555564;
+const FAINT: u32 = 0x646478;
+const ACCENT: u32 = 0x5b50cd;
+const ACCENT_HOVER: u32 = 0x4e43b9;
+const ACCENT_SOFT: u32 = 0xeeecff;
+const GREEN: u32 = 0x176c49;
+const GREEN_SOFT: u32 = 0xe6f5ed;
+const RED: u32 = 0xa8324a;
+const RED_SOFT: u32 = 0xfdeef1;
+const AMBER: u32 = 0x82550b;
+const AMBER_SOFT: u32 = 0xfff4de;
+const AMBER_BORDER: u32 = 0xedd6aa;
 const WHITE: u32 = 0xffffff;
 
 const INDEX_W: f32 = 36.0;
@@ -843,7 +844,7 @@ fn track_header() -> Div {
         .flex()
         .items_center()
         .gap_3()
-        .bg(rgb(0x111116))
+        .bg(rgb(BG))
         .border_b_1()
         .border_color(rgb(BORDER_SOFT))
         .child(
@@ -954,7 +955,7 @@ fn track_row(app: &mut Desktop, index: usize, cx: &mut Context<Desktop>) -> Div 
         .gap_3()
         .border_b_1()
         .border_color(rgb(BORDER_SOFT))
-        .hover(|style| style.bg(rgb(0x18181f)))
+        .hover(|style| style.bg(rgb(BG)))
         .child(
             div()
                 .w(px(INDEX_W))
@@ -1072,7 +1073,7 @@ fn download_row(entry: crate::downloads::Entry, index: usize, cx: &mut Context<D
         .gap_3()
         .border_b_1()
         .border_color(rgb(BORDER_SOFT))
-        .hover(|style| style.bg(rgb(0x18181f)))
+        .hover(|style| style.bg(rgb(BG)))
         .child(
             div()
                 .w(px(3.0))
@@ -1138,8 +1139,8 @@ fn provider_dot(provider: Provider) -> Div {
         .flex_shrink_0()
         .rounded_full()
         .bg(rgb(match provider {
-            Provider::Qq => 0x4fb3ff,
-            Provider::Netease => 0xf25b5b,
+            Provider::Qq => 0x2174b8,
+            Provider::Netease => 0xc83d50,
         }))
 }
 
@@ -1179,7 +1180,7 @@ fn nav_row(id: impl Into<gpui::ElementId>, selected: bool) -> Stateful<Div> {
         .cursor_pointer()
         .text_sm()
         .text_color(rgb(if selected { TEXT } else { MUTED }))
-        .bg(rgb(if selected { ELEVATED } else { SIDEBAR }))
+        .bg(rgb(if selected { ACCENT_SOFT } else { SIDEBAR }))
         .hover(|style| style.bg(rgb(HOVER)))
 }
 
@@ -1223,6 +1224,8 @@ fn qr_card(qr: Arc<Image>) -> Div {
     div()
         .rounded_lg()
         .bg(rgb(WHITE))
+        .border_1()
+        .border_color(rgb(BORDER_SOFT))
         .p(px(12.0))
         .child(img(qr).size(px(208.0)))
 }
@@ -1244,7 +1247,7 @@ fn notice_bar(message: String) -> Div {
         .rounded_md()
         .bg(rgb(AMBER_SOFT))
         .border_1()
-        .border_color(rgb(0x3a2f1a))
+        .border_color(rgb(AMBER_BORDER))
         .flex()
         .items_center()
         .gap_2()
